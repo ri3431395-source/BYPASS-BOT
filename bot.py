@@ -1,232 +1,291 @@
 """
 =========================================================
-  RH.RATUL VIDEO PROCESSOR BOT
-  Developer Credit: RH.RATUL
+ Telegram Video Encoder Bot
+ - Superfast re-encode (NVENC/x264 ultrafast preset)
+ - Vibrant color grading
+ - Metadata wipe/change
+ - Realtime % progress
+ Developer Credit: RH.RATUL
 =========================================================
 """
 
 import os
 import re
+import time
+import shutil
 import asyncio
 import logging
-import subprocess
-import tempfile
-import time
-import uuid
+from datetime import datetime
 
-from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
+# ---------------------------------------------------------
+# CONFIG  (Railway -> Variables tab e ei value gula set korben)
+# ---------------------------------------------------------
+API_ID = int(os.environ.get("API_ID", "0"))
+API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-LOCAL_API_URL = os.environ.get("LOCAL_API_URL", "").rstrip("/")
-DEVELOPER_CREDIT = "RH.RATUL"
 
-MAX_VIDEO_MB = 1900 if LOCAL_API_URL else 19
+DEV_CREDIT = "RH.RATUL"
+WORK_DIR = "downloads"
+os.makedirs(WORK_DIR, exist_ok=True)
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("videobot")
+
+app = Client(
+    "video_encoder_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
 )
-logger = logging.getLogger("rh-ratul-bot")
+
+# ---------------------------------------------------------
+# Helper: human readable size / time
+# ---------------------------------------------------------
+def human_size(num: float) -> str:
+    for unit in ["B", "KB", "MB", "GB"]:
+        if num < 1024:
+            return f"{num:.2f}{unit}"
+        num /= 1024
+    return f"{num:.2f}TB"
 
 
-def build_filter_chain(width_expr="iw", height_expr="ih"):
-    return (
-        "eq=contrast=1.07:saturation=1.15:brightness=0.02,"
-        "colorbalance=rs=0.08:gs=0.02:bs=-0.06:"
-        "rm=0.06:gm=0.0:bm=-0.04:"
-        "rh=0.03:gh=0.0:bh=-0.02,"
-        "vignette=PI/5,"
-        f"drawtext=text='{DEVELOPER_CREDIT}':"
-        "fontcolor=white@0.55:fontsize=h*0.025:"
-        "x=w-tw-12:y=h-th-12:"
-        "box=1:boxcolor=black@0.25:boxborderw=6"
+def human_time(seconds: int) -> str:
+    seconds = int(seconds)
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+def progress_bar(percent: float, length: int = 20) -> str:
+    filled = int(length * percent / 100)
+    return "█" * filled + "░" * (length - filled)
+
+
+# ---------------------------------------------------------
+# Pyrogram download/upload progress callback
+# ---------------------------------------------------------
+last_edit_time = {}
+
+async def tg_progress(current, total, message: Message, label: str):
+    chat_key = message.chat.id
+    now = time.time()
+    # throttle edits to ~ every 2 seconds to avoid flood limits
+    if chat_key in last_edit_time and now - last_edit_time[chat_key] < 2:
+        return
+    last_edit_time[chat_key] = now
+
+    percent = current * 100 / total if total else 0
+    text = (
+        f"**{label}**\n"
+        f"`{progress_bar(percent)}` {percent:.1f}%\n"
+        f"{human_size(current)} / {human_size(total)}\n\n"
+        f"⚙️ Dev: {DEV_CREDIT}"
+    )
+    try:
+        await message.edit_text(text)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------
+# FFmpeg encode with realtime progress parsing
+# ---------------------------------------------------------
+async def ffmpeg_encode(input_path: str, output_path: str, duration: float, status_msg: Message):
+    """
+    - ultrafast preset for speed
+    - vibrant color grading via eq + vibrance-like saturation boost
+    - metadata stripped & replaced with custom tag
+    """
+    vf_filter = (
+        "eq=contrast=1.08:brightness=0.02:saturation=1.35:gamma=1.02,"
+        "unsharp=3:3:0.5"
     )
 
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", vf_filter,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-map_metadata", "-1",          # strip all original metadata
+        "-metadata", f"title=Encoded by {DEV_CREDIT}",
+        "-metadata", f"comment=Processed via {DEV_CREDIT} VideoBot",
+        "-metadata", f"encoder={DEV_CREDIT}",
+        "-progress", "pipe:1",
+        "-nostats",
+        output_path,
+    ]
 
-TIME_RE = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-DURATION_RE = re.compile(r"Duration: (\d+):(\d+):(\d+\.\d+)")
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+
+    last_edit = 0
+    time_pattern = re.compile(r"out_time_ms=(\d+)")
+    start = time.time()
+
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        line = line.decode("utf-8", errors="ignore").strip()
+
+        match = time_pattern.search(line)
+        if match and duration > 0:
+            out_time_sec = int(match.group(1)) / 1_000_000
+            percent = min(out_time_sec / duration * 100, 100)
+
+            now = time.time()
+            if now - last_edit >= 2:
+                last_edit = now
+                elapsed = now - start
+                eta = (elapsed / percent * (100 - percent)) if percent > 1 else 0
+                text = (
+                    f"🎬 **Encoding Video...**\n"
+                    f"`{progress_bar(percent)}` {percent:.1f}%\n"
+                    f"⏱ Elapsed: {human_time(elapsed)} | ETA: {human_time(eta)}\n"
+                    f"🎨 Vibrant Color Grading: ON\n"
+                    f"🧹 Metadata: Cleaned & Re-tagged\n\n"
+                    f"⚙️ Dev: {DEV_CREDIT}"
+                )
+                try:
+                    await status_msg.edit_text(text)
+                except Exception:
+                    pass
+
+    await process.wait()
+    return process.returncode == 0
 
 
-def _to_seconds(h, m, s):
-    return int(h) * 3600 + int(m) * 60 + float(s)
-
-
-async def probe_duration(input_path: str) -> float:
-    proc = await asyncio.create_subprocess_exec(
+# ---------------------------------------------------------
+# Get video duration via ffprobe
+# ---------------------------------------------------------
+async def get_duration(path: str) -> float:
+    cmd = [
         "ffprobe", "-v", "error",
         "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1",
-        input_path,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
     )
-    out, _ = await proc.communicate()
+    out, _ = await process.communicate()
     try:
         return float(out.decode().strip())
     except Exception:
         return 0.0
 
 
-async def run_ffmpeg_with_progress(cmd, total_duration, on_progress):
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-
-    last_reported = -1
-    while True:
-        line = await proc.stderr.readline()
-        if not line:
-            break
-        text = line.decode(errors="ignore")
-        match = TIME_RE.search(text)
-        if match and total_duration > 0:
-            current = _to_seconds(*match.groups())
-            percent = min(99, int((current / total_duration) * 100))
-            if percent != last_reported:
-                last_reported = percent
-                await on_progress(percent)
-
-    await proc.wait()
-    return proc.returncode
-
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"👋 স্বাগতম! আমাকে যেকোনো ভিডিও পাঠান বা ফরওয়ার্ড করুন।\n\n"
-        f"আমি করব:\n"
-        f"⚡ সুপারফাস্ট রি-এনকোড\n"
-        f"🎨 সিনেমাটিক/উষ্ণ কালার গ্রেডিং\n"
-        f"🏷 মেটাডেটা পরিবর্তন\n"
-        f"📊 রিয়েলটাইম প্রগ্রেস %\n\n"
-        f"🔰 Developer Credit: {DEVELOPER_CREDIT}",
-        parse_mode=ParseMode.HTML,
+# ---------------------------------------------------------
+# /start command
+# ---------------------------------------------------------
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message):
+    await message.reply_text(
+        f"👋 **স্বাগতম!**\n\n"
+        f"আমাকে যেকোনো ভিডিও **পাঠান বা ফরওয়ার্ড করুন** (200-300MB ঠিক আছে)।\n"
+        f"আমি সেটা:\n"
+        f"🚀 সুপারফাস্ট রি-এনকোড করবো\n"
+        f"🎨 ভাইব্রেন্ট কালার গ্রেডিং দিবো\n"
+        f"🧹 মেটাডেটা ক্লিন করে নতুন ট্যাগ লাগাবো\n"
+        f"📊 রিয়েলটাইম % প্রগ্রেস দেখাবো\n\n"
+        f"⚙️ **Developer Credit: {DEV_CREDIT}**"
     )
 
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    video = message.video or message.document
-    if video is None:
+# ---------------------------------------------------------
+# Main video handler
+# ---------------------------------------------------------
+@app.on_message(filters.video | filters.document)
+async def video_handler(client: Client, message: Message):
+    media = message.video or message.document
+    if media is None:
         return
 
-    if getattr(video, "file_size", None) and video.file_size > MAX_VIDEO_MB * 1024 * 1024:
-        if LOCAL_API_URL:
-            await message.reply_text(f"⚠️ ভিডিওটি {MAX_VIDEO_MB}MB এর চেয়ে বড়, প্রসেস করা যাচ্ছে না।")
-        else:
-            await message.reply_text(
-                "⚠️ ভিডিওটি অনেক বড় (Cloud Bot API লিমিট ~20MB)।\n"
-                "২GB পর্যন্ত ভিডিও প্রসেস করতে Local Bot API Server সেটআপ করতে হবে।"
-            )
+    # if it's a document, make sure it's a video mime type
+    if message.document and not (message.document.mime_type or "").startswith("video"):
         return
 
-    status_msg = await message.reply_text("📥 ভিডিও ডাউনলোড হচ্ছে... 0%")
+    user_dir = os.path.join(WORK_DIR, str(message.chat.id))
+    os.makedirs(user_dir, exist_ok=True)
 
-    job_id = uuid.uuid4().hex[:8]
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = os.path.join(tmpdir, f"in_{job_id}.mp4")
-        output_path = os.path.join(tmpdir, f"out_{job_id}.mp4")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    input_path = os.path.join(user_dir, f"in_{timestamp}.mp4")
+    output_path = os.path.join(user_dir, f"out_{timestamp}.mp4")
 
-        tg_file = await video.get_file()
-        await tg_file.download_to_drive(input_path)
-        await status_msg.edit_text("✅ ডাউনলোড সম্পন্ন।\n🔍 ভিডিও বিশ্লেষণ হচ্ছে...")
+    status_msg = await message.reply_text(
+        f"📥 **Downloading...**\n`{progress_bar(0)}` 0.0%\n\n⚙️ Dev: {DEV_CREDIT}"
+    )
 
-        duration = await probe_duration(input_path)
+    try:
+        # ---------- DOWNLOAD ----------
+        await client.download_media(
+            message,
+            file_name=input_path,
+            progress=tg_progress,
+            progress_args=(status_msg, "📥 Downloading"),
+        )
 
-        filter_chain = build_filter_chain()
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", input_path,
-            "-vf", filter_chain,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-crf", "21",
-            "-c:a", "aac", "-b:a", "128k",
-            "-movflags", "+faststart",
-            "-metadata", f"title=Processed by {DEVELOPER_CREDIT}",
-            "-metadata", "artist=RH.RATUL",
-            "-metadata", "comment=Edited & Color Graded by RH.RATUL Bot",
-            "-metadata", "encoder=RH.RATUL-Engine",
-            output_path,
-        ]
+        await status_msg.edit_text(f"🔍 Analyzing video...\n\n⚙️ Dev: {DEV_CREDIT}")
+        duration = await get_duration(input_path)
 
-        last_edit_time = [0.0]
+        # ---------- ENCODE ----------
+        ok = await ffmpeg_encode(input_path, output_path, duration, status_msg)
 
-        async def on_progress(percent):
-            now = time.time()
-            if now - last_edit_time[0] < 1.5 and percent < 99:
-                return
-            last_edit_time[0] = now
-            bar_filled = percent // 5
-            bar = "▰" * bar_filled + "▱" * (20 - bar_filled)
-            try:
-                await status_msg.edit_text(
-                    f"⚙️ প্রসেসিং চলছে...\n"
-                    f"{bar}  {percent}%\n\n"
-                    f"🎨 কালার গ্রেডিং: সিনেমাটিক/উষ্ণ\n"
-                    f"🔰 {DEVELOPER_CREDIT}"
-                )
-            except Exception:
-                pass
-
-        await status_msg.edit_text("⚙️ এনকোডিং শুরু হচ্ছে... 0%")
-        try:
-            returncode = await run_ffmpeg_with_progress(cmd, duration, on_progress)
-        except FileNotFoundError:
-            await status_msg.edit_text("❌ সার্ভারে ffmpeg ইনস্টল নেই। হোস্টিং বিল্ড কনফিগ চেক করুন।")
+        if not ok or not os.path.exists(output_path):
+            await status_msg.edit_text(f"❌ Encoding failed.\n\n⚙️ Dev: {DEV_CREDIT}")
             return
 
-        if returncode != 0 or not os.path.exists(output_path):
-            await status_msg.edit_text("❌ প্রসেসিং ব্যর্থ হয়েছে, আবার চেষ্টা করুন।")
-            return
+        await status_msg.edit_text(f"📤 **Uploading...**\n`{progress_bar(0)}` 0.0%\n\n⚙️ Dev: {DEV_CREDIT}")
 
-        await status_msg.edit_text("📤 প্রসেসড ভিডিও আপলোড হচ্ছে... 100%")
+        out_size = os.path.getsize(output_path)
 
-        with open(output_path, "rb") as f:
-            await message.reply_video(
-                video=f,
-                caption=(
-                    f"✅ প্রসেসিং সম্পন্ন!\n"
-                    f"🎨 কালার গ্রেড: সিনেমাটিক/উষ্ণ\n"
-                    f"🏷 মেটাডেটা: পরিবর্তিত\n\n"
-                    f"🔰 Developer Credit: {DEVELOPER_CREDIT}"
-                ),
-                supports_streaming=True,
-            )
+        # ---------- UPLOAD ----------
+        await client.send_video(
+            chat_id=message.chat.id,
+            video=output_path,
+            caption=(
+                f"✅ **Done!**\n"
+                f"📦 Size: {human_size(out_size)}\n"
+                f"🎨 Color Grade: Vibrant\n"
+                f"🧹 Metadata: Cleaned\n\n"
+                f"⚙️ **Developer Credit: {DEV_CREDIT}**"
+            ),
+            progress=tg_progress,
+            progress_args=(status_msg, "📤 Uploading"),
+        )
 
         await status_msg.delete()
 
+    except Exception as e:
+        log.exception("Error processing video")
+        await status_msg.edit_text(f"❌ Error: `{e}`\n\n⚙️ Dev: {DEV_CREDIT}")
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error("Exception while handling update:", exc_info=context.error)
-
-
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("❌ BOT_TOKEN পরিবেশ ভ্যারিয়েবল সেট করা নেই।")
-
-    builder = Application.builder().token(BOT_TOKEN)
-    if LOCAL_API_URL:
-        builder = builder.base_url(f"{LOCAL_API_URL}/bot").base_file_url(f"{LOCAL_API_URL}/file/bot")
-        logger.info(f"Local Bot API Server ব্যবহার হচ্ছে: {LOCAL_API_URL}")
-    else:
-        logger.warning("LOCAL_API_URL সেট নেই — Cloud Bot API লিমিট প্রযোজ্য হবে")
-
-    app = builder.build()
-
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_error_handler(error_handler)
-
-    logger.info(f"Bot starting... Developer Credit: {DEVELOPER_CREDIT}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        # cleanup
+        for p in (input_path, output_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
-    main()
+    log.info(f"Bot starting... Developer Credit: {DEV_CREDIT}")
+    app.run()
